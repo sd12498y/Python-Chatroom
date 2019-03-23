@@ -12,6 +12,7 @@ import sys
 import socket
 import threading
 import time
+import select
 
 #
 # Global variables
@@ -24,10 +25,14 @@ userPort = 32341
 socketfd = None
 isJoined = False #to check whether the user has already joined a chatroom
 keepAlive = True
-memberList = list()
+memberList = dict()
 memberHash = None
 joinedRoomName = ""
 t1 = None
+server_thread = None
+RList = []
+WList = []
+
 #
 # This is the hash function for generating a unique
 # Hash ID for each peer.
@@ -106,7 +111,7 @@ def do_List():
 
 
 def do_Join():
-	global isJoined,socketfd,joinedRoomName, keepAlive,t1,memberList,memberHash
+	global isJoined,socketfd,joinedRoomName, keepAlive,t1,memberList,memberHash,server_thread
 	CmdWin.insert(1.0, "\nPress JOIN")
 	if not username:
 		CmdWin.insert(1.0, "\n[JOIN] Request rejected.You should register a username first.")
@@ -143,19 +148,27 @@ def do_Join():
 		joinedRoomName = roomName
 		members = dmsg[2:-4].split(":")
 		memberHash = members[0]
-		outstr = ''
-		for i in range(1,len(members)-2,3):
-			new_member = (members[i],members[i+1],members[i+2])
-			memberList.append(new_member)
-			print(new_member)
-			outstr += new_member[0] + ', '
-		CmdWin.insert(1.0, "\nMember: " +outstr)
+		memberList = create_member_record(members[1:])
 		isJoined = True
 		keepAlive = True
 		t1 = threading.Thread(target=keep_alive,args=(msg,))
 		t1.daemon = True
 		t1.start()
+		server_thread = threading.Thread(target=run_server)
+		server_thread.daemon = True
+		server_thread.start()
+
 	userentry.delete(0, END)
+
+def create_member_record(members):
+	tempRecord = dict()
+	outstr = ''
+	for i in range(0,len(members)-2,3):
+		tempRecord[members[i]] = (members[i+1],int(members[i+2]))
+		print(tempRecord[members[i]])
+		outstr += members[i] + ', '
+	CmdWin.insert(1.0, "\nMember in chatroom " + joinedRoomName + ": " + outstr)
+	return tempRecord
 
 def keep_alive(msg):
 	global memberHash, memberList
@@ -176,15 +189,7 @@ def keep_alive(msg):
 				#CmdWin.insert(1.0, "\nNo new member in the chatroom.")
 			else:
 				memberHash = members[0]
-				newMemberList = list()
-				outstr = ''
-				for i in range(1,len(members)-2,3):
-					new_member = (members[i],members[i+1],members[i+2])
-					newMemberList.append(new_member)
-					print(new_member)
-					outstr += new_member[0] + ', '
-				CmdWin.insert(1.0, "\nMember: " +outstr)
-				memberList = newMemberList
+				memberList = create_member_record(members[1:])
 				dmsg = rmsg.decode('ascii')
 				print(dmsg)
 		time.sleep(20)
@@ -195,15 +200,79 @@ def do_Send():
 
 
 def do_Poke():
+	global memberList
 	CmdWin.insert(1.0, "\nPress Poke")
+	target = userentry.get()
+	if isJoined:
+		if target:
+			if target != username:
+				if target in memberList:
+					print("found it!")
+					temp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+					msg = 'K:' + joinedRoomName + ':' + username+'::\r\n'
+					temp_socket.sendto(msg.encode('ascii'),memberList[target])
+					temp_socket.settimeout(2)
+					try:
+						rmsg, peerAddress = temp_socket.recvfrom(64)
+					except socket.timeout:
+						CmdWin.insert(1.0, "\nDid not receive ACK from the peer.")
+					CmdWin.insert(1.0, "\n" + target + " has received your poke;)")
+					temp_socket.close()
 
-def poke_thread():
+			else:
+				CmdWin.insert(1.0, "\nError: You can't poke youself.")
+		else:
+			CmdWin.insert(1.0, "\nError: Please enter a valid name.")
+			outstr = ''
+			for member in memberList:
+				outstr += str(member) + ', '
+			CmdWin.insert(1.0, "\nValid name are: " + outstr)
+	else:
+		CmdWin.insert(1.0, "\nError: Please join a chatroom first.")
+	
+	userentry.delete(0, END)
+	
+def run_server():
 	socketUdpReceiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 	socketUdpReceiver.bind((userAddress,userPort))
+	RList = [socketUdpReceiver]
+		# start the main loop
 	while True:
-		(rmsg, peer) = socketUdpReceiver.recvfrom(64)
-		print(rmsg)
-		print(peer)
+		# use select to wait for any incoming connection requests or
+		# incoming messages or 10 seconds
+		try:
+			Rready, Wready, Eready = select.select(RList, [], [], 10)
+		except select.error as emsg:
+			print("At select, caught an exception:", emsg)
+			sys.exit(1)
+		except KeyboardInterrupt:
+			print("At select, caught the KeyboardInterrupt")
+			sys.exit(1)
+
+		# if has incoming activities
+		if Rready:
+			# for each socket in the READ ready list
+			for sd in Rready:
+
+				# if the listening socket is ready
+				# that means a new connection request
+				# accept that new connection request
+				# add the new client connection to READ socket list
+				# add the new client connection to WRITE socket list
+				if sd == socketUdpReceiver:
+					(rmsg, peerAddress) = socketUdpReceiver.recvfrom(64)
+					dmsg = rmsg.decode('ascii')
+					info = dmsg[2:-4].split(':')
+					print(dmsg)
+					print(peerAddress)
+					msg = b'A::\r\n'
+					CmdWin.insert(1.0, "\n" + info[1] + " just poke you;)")
+					socketUdpReceiver.sendto(msg,peerAddress)
+
+		# else did not have activity for 10 seconds, 
+		# just print out "Idling"
+		else:
+			print("Server Idling")
 
 
 
