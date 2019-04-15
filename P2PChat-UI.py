@@ -17,28 +17,44 @@ import select
 #
 # Global variables
 #
-username = ""
-serverPort = 32340
-serverAddress = "localhost"
-userAddress = 'localhost'
-userPort = 32341
-socketfd = None
+
+#user stuff
+myUsername = ""
+myHashID = None
+myAddress = 'localhost'
+myPort = 32341
 isJoined = False #to check whether the user has already joined a chatroom
 keepAlive = True
-memberList = dict()
-memberHash = None
+roomMemberDict = dict() #data structure = myUsername: (ip, port)
+
+#chatroom stuff
+roomMemberHash = None
 joinedRoomName = ""
-t1 = None
+
+
+#theading stuff
+keep_alive_thread = None
 server_thread = None
+connection_thread = None
+
+#socket stuff
+msgID = 0
+serverPort = 32340
+serverAddress = "localhost"
+socketfd = None
+forwardLinkedMember = ()
+backwardLinkedMemberDict = dict()
 RList = []
 WList = []
 
+#messging
+messageCounter = dict()
 #
 # This is the hash function for generating a unique
 # Hash ID for each peer.
 # Source: http://www.cse.yorku.ca/~oz/hash.html
 #
-# Concatenate the peer's username, str(IP address), 
+# Concatenate the peer's myUsername, str(IP address), 
 # and str(Port) to form a string that be the input 
 # to this hash function
 #
@@ -55,19 +71,20 @@ def sdbm_hash(instr):
 
 def do_User():
 	tempName = userentry.get()
-	global username
+	global myUsername, myHashID, myPort,myAddress
 	outstr = "\n[User] username: "
 	if (len(tempName) > 0 and not isJoined):
-		if (not username):
-			username = tempName
-			outstr += username
+		if (not myUsername):
+			myUsername = str(tempName)
+			outstr += myUsername
+			myHashID = sdbm_hash(myUsername+myAddress+str(myPort))
 		else:
-			if(not tempName == username):
-				oldName = username
-				username = 	tempName
-				outstr += "Changed from " + oldName + " to " + username
+			if(not tempName == myUsername):
+				oldName = myUsername
+				myUsername = str(tempName)
+				outstr += "Changed from " + oldName + " to " + myUsername
 			else:
-				outstr += "Remains the same as " + username
+				outstr += "Remains the same as " + myUsername
 	else:
 		if (isJoined):
 			outstr += "Already joined a chatroom. Rejected"
@@ -111,9 +128,9 @@ def do_List():
 
 
 def do_Join():
-	global isJoined,socketfd,joinedRoomName, keepAlive,t1,memberList,memberHash,server_thread
+	global isJoined,socketfd,joinedRoomName, keepAlive,keep_alive_thread,roomMemberDict,roomMemberHash,server_thread
 	CmdWin.insert(1.0, "\nPress JOIN")
-	if not username:
+	if not myUsername:
 		CmdWin.insert(1.0, "\n[JOIN] Request rejected.You should register a username first.")
 		return
 	if isJoined:
@@ -124,6 +141,69 @@ def do_Join():
 	if not roomName:
 		CmdWin.insert(1.0, "\n[JOIN] Request rejected. Please enter your target chatroom name.")
 		return
+
+	rmsg = joinRoom(roomName)
+	# if the message is successfully received
+	if rmsg:
+		if(rmsg.decode("ascii")[0]=='M'):
+			startServer()
+			joinedRoomName = roomName #save the roomname to joinedRoomName
+			roomMemberHash, membersInfo = decodeResponse(rmsg)
+			roomMemberDict = create_member_record(membersInfo) #this is where we store the actual member info
+			if (len(roomMemberDict)>1):
+				create_forward_link()
+			else:
+				CmdWin.insert(1.0, "\n[JOIN]"+ " Chatroom " + joinedRoomName + " created")
+				print("Chatroom " + joinedRoomName + " created")
+			isJoined = True
+			keepAlive = True
+			startConnectionHandler()
+			startKeepAlive()
+	userentry.delete(0, END)
+
+def startKeepAlive():
+	# a new thread for keeping the connection between the peer and the server alive
+	keep_alive_thread = threading.Thread(target=keep_alive)
+	keep_alive_thread.daemon = True
+	keep_alive_thread.start()
+
+def startServer():
+	#a new thread called server_thread is established for listening poke request
+	server_thread = threading.Thread(target=run_server)
+	server_thread.daemon = True
+	server_thread.start()
+
+def decodeResponse(rmsg):
+	#decode the message
+	dmsg = rmsg.decode('ascii')
+	data_string = dmsg[2:-4].split(":") #generate a list of member in the rooms
+	print(dmsg[0])
+	if (dmsg[0] == 'M'):
+		return data_string[0], data_string[1:] #roomHash, memberlist
+	elif (dmsg[0] == 'A'):
+		return data_string[0],data_string[1] #roomname, sendername
+	elif (dmsg[0] == 'P'):
+		return data_string[0], data_string[1], data_string[2], data_string[3], data_string[4]
+	elif (dmsg[0] == 'T'):
+		length = data_string[4]
+		content = dmsg[-(int(length)+4):-4]
+		return data_string[0], data_string[1], data_string[2], data_string[3],length, content
+	elif (dmsg[0] == 'S'):
+		return data_string[0]
+	elif (dmsg[0] == 'K'):
+		return data_string[0],data_string[1]
+
+
+def updateMemberList():
+	res = joinRoom(joinedRoomName)
+	global roomMemberDict
+	if res:
+		tempHash, tempMember = decodeResponse(res)
+		if (tempHash != roomMemberHash):
+			roomMemberDict =  create_member_record(tempMember)
+
+def joinRoom(roomName):
+	global socketfd
 	if not socketfd:
 		socketfd = socket.socket()
 		try:
@@ -133,90 +213,169 @@ def do_Join():
 			sys.exit(1)
 	# send the message
 	rm = ":" + roomName
-	un = ":" + username
-	ip = ":" + userAddress
-	pt = ":" + str(userPort)
+	un = ":" + myUsername
+	ip = ":" + myAddress
+	pt = ":" + str(myPort)
 	msg = "J" + rm + un + ip + pt + "::\r\n"
 	try:
 		socketfd.sendall(msg.encode('ascii'))
 	except socket.error as err:
 		print("Sending error: ", err)
-	# receive the message
+	# try to receive the message
 	rmsg = socketfd.recv(1024)
-	if rmsg:
-		dmsg = rmsg.decode('ascii')
-		joinedRoomName = roomName
-		members = dmsg[2:-4].split(":")
-		memberHash = members[0]
-		memberList = create_member_record(members[1:])
-		isJoined = True
-		keepAlive = True
-		t1 = threading.Thread(target=keep_alive,args=(msg,))
-		t1.daemon = True
-		t1.start()
-		server_thread = threading.Thread(target=run_server)
-		server_thread.daemon = True
-		server_thread.start()
+	print(len(rmsg))
+	if (len(rmsg)>0):
+		return rmsg
+	else:
+		return None
 
-	userentry.delete(0, END)
 
-def create_member_record(members):
+def create_forward_link():
+	tempList = list()
+	for user in roomMemberDict.items():
+		username = user[0]
+		userIp = user[1][0]
+		userPort = user[1][1]
+		userHash = sdbm_hash(str(username) + str(userIp) + str(userPort))
+		tempList.append((userHash,str(username), str(userIp), int(userPort)))
+	tempList.sort(key=lambda tup: tup[0]) #sort by userHash
+	print(tempList)
+	start = (tempList.index((myHashID,myUsername,myAddress,myPort)) + 1) % len(tempList)
+	while (tempList[start][0] != myHashID):
+		if(tempList[start][1] in backwardLinkedMemberDict):
+			start = (start + 1) % len(tempList)
+		else:
+			try:
+				if (handshake(tempList[start])):
+					print("Forward link successfully established. You are connected.")
+					return
+				else:
+					start = (start + 1) % len(tempList)
+			except socket.error as err:
+				print(err)
+	print(forwardLinkedMember)
+	if (not forwardLinkedMember):
+		print ("ERROR: Cannot establish TCP connection with Peer. System will start the connection procedure later")
+		#TO-DO: reschedule the conneciton
+
+def startConnectionHandler():
+	#a new thread called server_thread is established for listening poke request
+	connection_thread = threading.Thread(target=connectionHandling)
+	connection_thread.daemon = True
+	connection_thread.start()
+
+def connectionHandling():
+	#it runs only when it has joined a room
+	global forwardLinkedMember
+	while isJoined:
+		if(len(roomMemberDict)>1):
+			if (forwardLinkedMember):
+				if(forwardLinkedMember[0] not in roomMemberDict):
+					forwardLinkedMember = None
+					print("WARNING: Your forward link has dismissed.")
+			else:
+				#user is disconnected
+				print("WARNING: You have to connect to one forward link to make sure the system is working. System is reconnecting...")
+				create_forward_link()
+		time.sleep(1)
+
+def handshake(user):
+	# create socket and connect to Comm_pipe
+	global forwardLinkedMember,RList,WList
+	tempSocket = socket.socket()
+	try:
+		print(user)
+		tempSocket.connect((user[2], int(user[3])))
+		msg = 'P:' + joinedRoomName + ':' + myUsername+':' + myAddress +':' + str(myPort) +':' + str(msgID)+'::\r\n'
+		tempSocket.sendall(msg.encode("ascii"))
+		try:
+			# receive the message
+			rmsg = tempSocket.recv(50)
+			mID = decodeResponse(rmsg)
+			RList.append(tempSocket)
+			WList.append(tempSocket)
+			forwardLinkedMember = (user[1], tempSocket) #uss username as the key to find out the socket
+			messageCounter[str(user[1])] = int(mID)
+			return True
+		except socket.error as err:
+			print("Connection error: " ,err)
+	except socket.error as err:
+		print("Connection error: " ,err)
+		sys.exit(1)
+	return False
+
+
+def create_member_record(raw_data_string):
 	tempRecord = dict()
 	outstr = ''
-	for i in range(0,len(members)-2,3):
-		tempRecord[members[i]] = (members[i+1],int(members[i+2]))
-		print(tempRecord[members[i]])
-		outstr += members[i] + ', '
+	for i in range(0,len(raw_data_string)-2,3):
+		tempRecord[raw_data_string[i]] = (raw_data_string[i+1],int(raw_data_string[i+2])) # the data structure is a dictionary of tuples
+		print(tempRecord[raw_data_string[i]])
+		outstr += raw_data_string[i] + ', '
 	CmdWin.insert(1.0, "\nMember in chatroom " + joinedRoomName + ": " + outstr)
 	return tempRecord
 
-def keep_alive(msg):
-	global memberHash, memberList
+def keep_alive():
+	global roomMemberHash, roomMemberDict
 	while True:
 		if not keepAlive:
 			return
-		try:
-			socketfd.sendall(msg.encode('ascii'))
-		except socket.error as err:
-			print("Sending error: ", err)
-		# receive the message
-		rmsg = socketfd.recv(1024)
+		rmsg = joinRoom(joinedRoomName)
 		if rmsg:
 			dmsg = rmsg.decode('ascii')
-			members = dmsg[2:-4].split(":")
-			if memberHash == members[0]:
+			raw_data_string = dmsg[2:-4].split(":")
+			if roomMemberHash == raw_data_string[0]:
 				pass
 				#CmdWin.insert(1.0, "\nNo new member in the chatroom.")
 			else:
-				memberHash = members[0]
-				memberList = create_member_record(members[1:])
+				roomMemberHash = raw_data_string[0]
+				roomMemberDict = create_member_record(raw_data_string[1:])
 				dmsg = rmsg.decode('ascii')
 				print(dmsg)
 		time.sleep(20)
 		
+def isConnected():
+	return forwardLinkedMember or backwardLinkedMemberDict
 
 def do_Send():
-	CmdWin.insert(1.0, "\nPress Send")
+	msg = userentry.get()
+	global myUsername, myHashID, myPort,myAddress,msgID
+	if (len(msg) > 0):
+		if(isJoined):
+			if(isConnected()):
+				msgID += 1
+				fullMsg = "T:" + joinedRoomName + ":" + str(myHashID) + ":" + myUsername + ":" + str(msgID) + ":" + str(len(msg)) +":" + msg + "::\r\n"
+				sendMessge(fullMsg)
+				CmdWin.insert(1.0, "\n" +myUsername + ": " + msg)
+			else:
+				CmdWin.insert(1.0, "\nYou are disconnected right now. Can't send any message")
+		else:
+			CmdWin.insert(1.0, "\nPlease join a chatroom")
+	else:
+		CmdWin.insert(1.0, "\nERROR: Empty entry. Rejected")
+	
+	userentry.delete(0, END)
+	
 
 
 def do_Poke():
-	global memberList
+	global roomMemberDict
 	CmdWin.insert(1.0, "\nPress Poke")
 	target = userentry.get()
 	if isJoined:
 		if target:
-			if target != username:
-				if target in memberList:
+			if target != myUsername:
+				if target in roomMemberDict:
 					print("found it!")
 					temp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-					msg = 'K:' + joinedRoomName + ':' + username+'::\r\n'
-					temp_socket.sendto(msg.encode('ascii'),memberList[target])
+					msg = 'K:' + joinedRoomName + ':' + myUsername+'::\r\n'
+					temp_socket.sendto(msg.encode('ascii'),roomMemberDict[target])
 					temp_socket.settimeout(2)
 					try:
 						rmsg, peerAddress = temp_socket.recvfrom(64)
+						CmdWin.insert(1.0, "\n" + target + " has received your poke;)")
 					except socket.timeout:
 						CmdWin.insert(1.0, "\nDid not receive ACK from the peer.")
-					CmdWin.insert(1.0, "\n" + target + " has received your poke;)")
 					temp_socket.close()
 
 			else:
@@ -224,7 +383,7 @@ def do_Poke():
 		else:
 			CmdWin.insert(1.0, "\nError: Please enter a valid name.")
 			outstr = ''
-			for member in memberList:
+			for member in roomMemberDict:
 				outstr += str(member) + ', '
 			CmdWin.insert(1.0, "\nValid name are: " + outstr)
 	else:
@@ -233,9 +392,22 @@ def do_Poke():
 	userentry.delete(0, END)
 	
 def run_server():
+	global RList, WList
 	socketUdpReceiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-	socketUdpReceiver.bind((userAddress,userPort))
-	RList = [socketUdpReceiver]
+	socketUdpReceiver.bind((myAddress,myPort))
+	socketTCPServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	socketTCPServer.settimeout(1.0)
+
+	try:
+		socketTCPServer.bind((myAddress,myPort))
+		print("TCP server listening...")
+	except socket.error as msg:
+		print("Socket Bind Error: " + str(msg))
+	# set socket listening queue
+	socketTCPServer.listen(5)
+
+	RList.append(socketUdpReceiver)
+	RList.append(socketTCPServer)
 		# start the main loop
 	while True:
 		# use select to wait for any incoming connection requests or
@@ -261,27 +433,81 @@ def run_server():
 				# add the new client connection to WRITE socket list
 				if sd == socketUdpReceiver:
 					(rmsg, peerAddress) = socketUdpReceiver.recvfrom(64)
-					dmsg = rmsg.decode('ascii')
-					info = dmsg[2:-4].split(':')
-					print(dmsg)
-					print(peerAddress)
+					rmName, senderName = decodeResponse(rmsg)
 					msg = b'A::\r\n'
-					CmdWin.insert(1.0, "\n" + info[1] + " just poke you;)")
+					CmdWin.insert(1.0, "\n" + senderName + " just poke you;)")
 					socketUdpReceiver.sendto(msg,peerAddress)
+				elif sd == socketTCPServer:
+					newfd, caddr = socketTCPServer.accept()
+					print("TCP server receive connection request")
+					RList.append(newfd)
+					WList.append(newfd)
+				else:
+					rmsg = sd.recv(500)
+					if rmsg:
+						if (rmsg.decode("ascii")[0] == 'P'):
+							roomname, username, userip, userport, mID = decodeResponse(rmsg)
+							updateMemberList()
+							global msgID
+							if(username in roomMemberDict):
+								msg = "S:" + str(msgID) + "::\r\n"
+								backwardLinkedMemberDict[str(username)] = sd
+								messageCounter[str(username)] = int(mID)
+								print("Backward link is successfully established")
+								sd.sendall(msg.encode("ascii"))
+							else:
+								sd.close()
+						elif (rmsg.decode("ascii")[0] == 'T'):
+							roomname, originHID, origin_username, mID, msgLength, content = decodeResponse(rmsg)
+							if (roomname == joinedRoomName):
+								if(origin_username not in roomMemberDict):
+									updateMemberList()
+								if(str(origin_username) in messageCounter):
+									if(messageCounter[str(origin_username)] != int(mID)):
+										messageCounter[str(origin_username)] = int(mID)
+										CmdWin.insert(1.0, "\n" +  origin_username + ": " + content)
+										forwardMessage(originHID, origin_username, rmsg)
+								else:
+									messageCounter[str(origin_username)] = int(mID)
+									CmdWin.insert(1.0, "\n" +  origin_username + ": " + content)
+									forwardMessage(originHID, origin_username, rmsg)
+							else:
+								print("ERROR: Received message from a person out of the room")
+								CmdWin.insert(1.0, "ERROR: Received message from a person out of the room")
+
+						
+					else:
+						print("A client connection is broken!!")
+						WList.remove(sd)
+						RList.remove(sd)
+
+					
 
 		# else did not have activity for 10 seconds, 
 		# just print out "Idling"
 		else:
 			print("Server Idling")
 
-
+def sendMessge(msg):
+	if(forwardLinkedMember):
+		forwardLinkedMember[1].sendall(msg.encode("ascii"))
+	if(backwardLinkedMemberDict):
+		for sd in backwardLinkedMemberDict:
+			backwardLinkedMemberDict[sd].sendall(msg.encode("ascii"))
+	return
+def forwardMessage(originHID, origin_username, rmsg):
+	if(forwardLinkedMember and forwardLinkedMember[0] != origin_username):
+		forwardLinkedMember[1].sendall(rmsg)
+	for peer in backwardLinkedMemberDict.items():
+		if (peer[0] != str(origin_username)):
+			peer[1].sendall(rmsg)
 
 def do_Quit():
 	CmdWin.insert(1.0, "\nPress Quit")
-	global keepAlive,t1
+	global keepAlive,keep_alive_thread
 	keepAlive = False
-	#if t1:
-	#	t1.join()
+	#if keep_alive_thread:
+	#	keep_alive_thread.join()
 	sys.exit(0)
 
 
@@ -337,7 +563,7 @@ def main():
 	if len(sys.argv) != 4:
 		print("P2PChat.py <server address> <server port no.> <my port no.>")
 		sys.exit(2)
-	global serverPort, serverAddress, userPort
+	global serverPort, serverAddress, myPort
 	try:
 		serverPort = int(sys.argv[2])
 	except:
@@ -347,9 +573,9 @@ def main():
 	except:
 		serverAddress = 'localhost'
 	try:
-		userPort = int(sys.argv[3])
+		myPort = int(sys.argv[3])
 	except:
-		userPort = 32341
+		myPort = 32341
 
 
 	win.mainloop()
