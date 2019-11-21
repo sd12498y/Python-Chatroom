@@ -3,8 +3,8 @@
 # Student name and No.:
 # Student name and No.:
 # Development platform:
-# Python version:
-# Version:
+# Python version: 3.6
+# Version:1
 
 ##Hi
 from tkinter import *
@@ -43,7 +43,9 @@ serverPort = 32340
 serverAddress = "localhost"
 socketfd = None
 forwardLinkedMember = ()
-backwardLinkedMemberDict = dict()
+backwardLinkedMemberDict = dict() #name: socket
+socketUdpReceiver = None
+socketTCPServer = None
 RList = []
 WList = []
 
@@ -301,7 +303,6 @@ def handshake(user):
 			print("Connection error: " ,err)
 	except socket.error as err:
 		print("Connection error: " ,err)
-		sys.exit(1)
 	return False
 
 
@@ -310,9 +311,24 @@ def create_member_record(raw_data_string):
 	outstr = ''
 	for i in range(0,len(raw_data_string)-2,3):
 		tempRecord[raw_data_string[i]] = (raw_data_string[i+1],int(raw_data_string[i+2])) # the data structure is a dictionary of tuples
-		print(tempRecord[raw_data_string[i]])
+		#print(tempRecord[raw_data_string[i]])
 		outstr += raw_data_string[i] + ', '
-	CmdWin.insert(1.0, "\nMember in chatroom " + joinedRoomName + ": " + outstr)
+	if(not roomMemberDict):
+		CmdWin.insert(1.0, "\nMembers in the room: " + outstr)
+	else:
+		removedMember = roomMemberDict.items() - tempRecord.items()
+		for member in removedMember:
+			CmdWin.insert(1.0, "\n" + member[0] + " has left the room")
+		newMember = tempRecord.items() - roomMemberDict.items()
+		for member in newMember:
+			CmdWin.insert(1.0, "\n" + member[0] + " has joined the room")
+	global backwardLinkedMemberDict
+	if(backwardLinkedMemberDict):
+		tempBackward = dict()
+		for peer in backwardLinkedMemberDict.items():
+			if (peer[0] in tempRecord):
+				tempBackward[peer[0]] = peer[1]
+		backwardLinkedMemberDict = tempBackward
 	return tempRecord
 
 def keep_alive():
@@ -346,7 +362,7 @@ def do_Send():
 				msgID += 1
 				fullMsg = "T:" + joinedRoomName + ":" + str(myHashID) + ":" + myUsername + ":" + str(msgID) + ":" + str(len(msg)) +":" + msg + "::\r\n"
 				sendMessge(fullMsg)
-				CmdWin.insert(1.0, "\n" +myUsername + ": " + msg)
+				MsgWin.insert(1.0, "\n" +myUsername + ": " + msg)
 			else:
 				CmdWin.insert(1.0, "\nYou are disconnected right now. Can't send any message")
 		else:
@@ -360,7 +376,7 @@ def do_Send():
 
 def do_Poke():
 	global roomMemberDict
-	CmdWin.insert(1.0, "\nPress Poke")
+	#CmdWin.insert(1.0, "\nPress Poke")
 	target = userentry.get()
 	if isJoined:
 		if target:
@@ -373,10 +389,12 @@ def do_Poke():
 					temp_socket.settimeout(2)
 					try:
 						rmsg, peerAddress = temp_socket.recvfrom(64)
-						CmdWin.insert(1.0, "\n" + target + " has received your poke;)")
+						MsgWin.insert(1.0, "\n" + target + " has received your poke;)")
 					except socket.timeout:
 						CmdWin.insert(1.0, "\nDid not receive ACK from the peer.")
 					temp_socket.close()
+				else:
+					CmdWin.insert(1.0, "\nERROR: Nickname not found!.")
 
 			else:
 				CmdWin.insert(1.0, "\nError: You can't poke youself.")
@@ -392,7 +410,7 @@ def do_Poke():
 	userentry.delete(0, END)
 	
 def run_server():
-	global RList, WList
+	global RList, WList, socketUdpReceiver, socketTCPServer
 	socketUdpReceiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 	socketUdpReceiver.bind((myAddress,myPort))
 	socketTCPServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -435,7 +453,7 @@ def run_server():
 					(rmsg, peerAddress) = socketUdpReceiver.recvfrom(64)
 					rmName, senderName = decodeResponse(rmsg)
 					msg = b'A::\r\n'
-					CmdWin.insert(1.0, "\n" + senderName + " just poke you;)")
+					MsgWin.insert(1.0, "\n" + senderName + " just poke you;)")
 					socketUdpReceiver.sendto(msg,peerAddress)
 				elif sd == socketTCPServer:
 					newfd, caddr = socketTCPServer.accept()
@@ -465,11 +483,11 @@ def run_server():
 								if(str(origin_username) in messageCounter):
 									if(messageCounter[str(origin_username)] != int(mID)):
 										messageCounter[str(origin_username)] = int(mID)
-										CmdWin.insert(1.0, "\n" +  origin_username + ": " + content)
+										MsgWin.insert(1.0, "\n" +  origin_username + ": " + content)
 										forwardMessage(originHID, origin_username, rmsg)
 								else:
 									messageCounter[str(origin_username)] = int(mID)
-									CmdWin.insert(1.0, "\n" +  origin_username + ": " + content)
+									MsgWin.insert(1.0, "\n" +  origin_username + ": " + content)
 									forwardMessage(originHID, origin_username, rmsg)
 							else:
 								print("ERROR: Received message from a person out of the room")
@@ -493,21 +511,37 @@ def sendMessge(msg):
 		forwardLinkedMember[1].sendall(msg.encode("ascii"))
 	if(backwardLinkedMemberDict):
 		for sd in backwardLinkedMemberDict:
-			backwardLinkedMemberDict[sd].sendall(msg.encode("ascii"))
+			try:
+				backwardLinkedMemberDict[sd].sendall(msg.encode("ascii"))
+			except BrokenPipeError as err:
+				continue
 	return
 def forwardMessage(originHID, origin_username, rmsg):
 	if(forwardLinkedMember and forwardLinkedMember[0] != origin_username):
 		forwardLinkedMember[1].sendall(rmsg)
 	for peer in backwardLinkedMemberDict.items():
 		if (peer[0] != str(origin_username)):
-			peer[1].sendall(rmsg)
+			try:
+				peer[1].sendall(rmsg)
+			except BrokenPipeError as err:
+				continue
 
 def do_Quit():
 	CmdWin.insert(1.0, "\nPress Quit")
 	global keepAlive,keep_alive_thread
 	keepAlive = False
+	isJoined = False
 	#if keep_alive_thread:
 	#	keep_alive_thread.join()
+	if (forwardLinkedMember):
+		forwardLinkedMember[1].close()
+	if (backwardLinkedMemberDict):
+		for peer in backwardLinkedMemberDict.items():
+			peer[1].close()
+	if(socketUdpReceiver):
+		socketUdpReceiver.close()
+	if(socketTCPServer):
+		socketTCPServer.close()
 	sys.exit(0)
 
 
